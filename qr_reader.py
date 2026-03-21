@@ -51,7 +51,10 @@ def main() -> int:
                 logger.error("Frame grab failed")
                 return 1
 
-            data, bbox, _ = detector.detectAndDecode(frame)
+            try:
+                data, bbox, _ = detector.detectAndDecode(frame)
+            except cv2.error:
+                data, bbox = "", None
 
             if bbox is not None and len(bbox) > 0:
                 pts = bbox.astype(int).reshape(-1, 2)

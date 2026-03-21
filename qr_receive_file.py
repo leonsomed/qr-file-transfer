@@ -56,6 +56,24 @@ def _parse_chunk(obj: dict) -> tuple[int, str] | None:
     return order, data
 
 
+def _log_data_chunk_progress(metadata: dict | None, chunks: dict[int, str]) -> None:
+    received = len(chunks)
+    if metadata is not None:
+        total = metadata["chunks"]
+        remaining = max(0, total - received)
+        logger.info(
+            "Data chunks received: %s/%s (%s remaining)",
+            received,
+            total,
+            remaining,
+        )
+    else:
+        logger.info(
+            "Data chunks received: %s (metadata not read yet; total unknown)",
+            received,
+        )
+
+
 def _finalize(metadata: dict, chunks: dict[int, str], out_dir: Path) -> int:
     n = metadata["chunks"]
     parts: list[str] = []
@@ -128,7 +146,11 @@ def main() -> int:
                 logger.error("Frame grab failed")
                 return 1
 
-            data, bbox, _ = detector.detectAndDecode(frame)
+            try:
+                data, bbox, _ = detector.detectAndDecode(frame)
+            except cv2.error:
+                # OpenCV can throw on degenerate/false-positive contours (e.g. contourArea == 0).
+                data, bbox = "", None
 
             if bbox is not None and len(bbox) > 0:
                 pts = bbox.astype(int).reshape(-1, 2)
@@ -150,6 +172,7 @@ def main() -> int:
                                 metadata["chunks"],
                                 metadata["sha256"][:16],
                             )
+                            _log_data_chunk_progress(metadata, chunks)
                         elif metadata != norm:
                             metadata = norm
                             chunks = {}
@@ -159,10 +182,14 @@ def main() -> int:
                                 metadata["chunks"],
                                 metadata["sha256"][:16],
                             )
+                            _log_data_chunk_progress(metadata, chunks)
                     parsed = _parse_chunk(obj)
                     if parsed is not None:
                         order, chunk_data = parsed
+                        new_index = order not in chunks
                         chunks[order] = chunk_data
+                        if new_index:
+                            _log_data_chunk_progress(metadata, chunks)
 
             if metadata is not None:
                 n = metadata["chunks"]

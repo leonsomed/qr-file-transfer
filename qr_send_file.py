@@ -67,7 +67,7 @@ def _encode_qr_bgr(payload: str) -> np.ndarray:
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=6,
+        box_size=8,
         border=2,
     )
     qr.add_data(payload)
