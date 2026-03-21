@@ -1,0 +1,13 @@
+"""Shared limits and JSON payload type tags for QR file transfer."""
+
+MAX_FILE_BYTES = 100 * 1024 * 1024
+
+CHUNK_HEX_CHARS_DEFAULT = 2500
+CHUNK_HEX_CHARS_MIN = 64
+CHUNK_HEX_CHARS_MAX = 4296
+
+DWELL_SECONDS_DEFAULT = 2.0
+DWELL_SECONDS_MIN = 0.2
+
+METADATA_TYPE = "file_metadata"
+CHUNK_TYPE = "data_chunk"
