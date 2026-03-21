@@ -22,8 +22,8 @@ Both sides use a **camera** and a **screen**. The sender must see the receiverâ€
 
 1. Sender shows `file_metadata` until its camera sees the **same** metadata JSON echoed on the receiverâ€™s screen.
 2. Sender sends `data_chunk` QRs; each chunk JSON includes `sha256` so the receiver can ignore foreign payloads.
-3. The receiver shows a **split view**: camera feed on the left (decode ROI), outbound QR on the right (metadata echo, then `missing_ranges` control).
-4. If the sender repeats chunks or loops before the file is complete, the receiver refreshes `missing_ranges` only after a **5s confirmation** window with continued redundant/loop signals.
+3. The receiver shows a **split view**: camera feed on the left, outbound QR on the right (metadata echo, then `missing_ranges` control). Incoming QRs are decoded from the **full** camera frame (same as one-way), not only the left panel.
+4. After the first control QR (post-handshake), the receiver refreshes `missing_ranges` only after **three** duplicate decodes of **three different chunk orders** in a row (several decodes of the same order in a row count as one). Any non-duplicate decode resets the counter.
 5. Optional **resume cache** (bidirectional only): `--progress-cache PATH` writes progress every 60s (override with `--progress-interval`). On restart, state is loaded and `missing_ranges` is shown immediately. `--progress-cache` is rejected if `--mode` is not `bidirectional`.
 
 ```bash

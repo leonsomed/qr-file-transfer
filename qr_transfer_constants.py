@@ -14,7 +14,9 @@ CHUNK_TYPE = "data_chunk"
 MISSING_RANGES_TYPE = "missing_ranges"
 
 MAX_MISSING_RANGE_ENTRIES = 100
-CONTROL_METADATA_CONFIRMATION_SEC = 5.0
+# Bidirectional: refresh missing_ranges control QR after this many duplicate decodes
+# of distinct chunk orders in a row (repeated decodes of the same order count once).
+CONTROL_METADATA_CONSECUTIVE_REPEATS = 3
 
 PROGRESS_CACHE_VERSION = 1
 PROGRESS_CACHE_INTERVAL_DEFAULT = 60.0

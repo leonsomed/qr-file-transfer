@@ -19,19 +19,21 @@ import numpy as np
 
 from qr_transfer_codec import (
     build_missing_ranges_object,
+    format_inclusive_chunk_ranges,
     indices_to_ranges,
     json_compact,
     missing_indices_for_file,
 )
+from qr_transfer_display import compose_bidirectional_layout
 from qr_transfer_constants import (
     CHUNK_TYPE,
-    CONTROL_METADATA_CONFIRMATION_SEC,
+    CONTROL_METADATA_CONSECUTIVE_REPEATS,
     MAX_MISSING_RANGE_ENTRIES,
     METADATA_TYPE,
     PROGRESS_CACHE_INTERVAL_DEFAULT,
     PROGRESS_CACHE_VERSION,
 )
-from qr_transfer_qr import make_qr_bgr, resize_to_height
+from qr_transfer_qr import make_qr_bgr
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -146,29 +148,13 @@ def _finalize(
     return 0
 
 
-def _decode_left_half(detector: cv2.QRCodeDetector, frame: np.ndarray) -> str:
-    h, w = frame.shape[:2]
-    if w < 4:
-        return ""
-    roi = frame[:, : w // 2]
+def _decode_frame_safe(detector: cv2.QRCodeDetector, frame: np.ndarray) -> str:
+    """Decode QR from the full camera frame (same coverage as one-way mode)."""
     try:
-        data, _, _ = detector.detectAndDecode(roi)
+        data, _, _ = detector.detectAndDecode(frame)
     except cv2.error:
         return ""
     return data or ""
-
-
-def _compose_split(left_bgr: np.ndarray, right_bgr: np.ndarray, target_h: int = 480) -> np.ndarray:
-    lh = resize_to_height(left_bgr, target_h)
-    rh = resize_to_height(right_bgr, target_h)
-    h = max(lh.shape[0], rh.shape[0])
-    lh = resize_to_height(lh, h)
-    rh = resize_to_height(rh, h)
-    w = lh.shape[1] + rh.shape[1]
-    out = np.zeros((h, w, 3), dtype=np.uint8)
-    out[:, : lh.shape[1]] = lh
-    out[:, lh.shape[1] :] = rh
-    return out
 
 
 def _load_progress_cache(path: Path) -> tuple[dict | None, dict[int, str], str | None]:
@@ -325,10 +311,8 @@ def _run_bidirectional(
     metadata_json: str | None = None
     handshake_done = False
     last_max_order: int | None = None
-    first_control_emitted = False
-    confirm_deadline: float | None = None
-    issues_during_arm = 0
-    last_control_emit = 0.0
+    consecutive_repeat_streak = 0
+    last_counted_repeat_order: int | None = None
     echo_bgr: np.ndarray | None = None
     control_bgr: np.ndarray | None = None
     cache_path: Path | None = Path(args.progress_cache).resolve() if args.progress_cache else None
@@ -374,8 +358,6 @@ def _run_bidirectional(
                 except Exception as e:
                     logger.error("Could not build control QR from cache: %s", e)
                     return 1
-                first_control_emitted = True
-                last_control_emit = time.monotonic()
                 handshake_done = True
                 logger.info("Resume from cache: showing missing_ranges for peer immediately.")
                 logger.info(
@@ -388,7 +370,7 @@ def _run_bidirectional(
         if metadata is None:
             logger.info(
                 "Handshake step 1/3: Waiting for sender's file_metadata QR "
-                "(decoded from the left half of the window)."
+                "(decoded from the full camera frame; left panel is only the preview)."
             )
         elif not handshake_done:
             logger.info(
@@ -423,40 +405,50 @@ def _run_bidirectional(
                 control_bgr = img
 
         def emit_control_immediate(reason: str) -> None:
-            nonlocal first_control_emitted, last_control_emit, control_bgr
             recompute_control_bgr()
             if control_bgr is not None:
-                first_control_emitted = True
-                last_control_emit = time.monotonic()
                 logger.info("Control QR updated (%s)", reason)
 
-        def try_emit_after_confirm() -> None:
-            nonlocal confirm_deadline, issues_during_arm, last_control_emit
-            if confirm_deadline is None:
-                return
-            now = time.monotonic()
-            if now < confirm_deadline:
-                return
-            confirm_deadline = None
-            if issues_during_arm <= 0:
-                return
-            issues_during_arm = 0
-            with state_lock:
-                if metadata is None:
-                    return
-                ntot = metadata["chunks"]
-                if len(chunks) >= ntot:
-                    return
-                miss = missing_indices_for_file(ntot, set(chunks))
-                if not miss:
-                    return
-            if now - last_control_emit < CONTROL_METADATA_CONFIRMATION_SEC and first_control_emitted:
-                return
+        def manual_refresh_control() -> None:
+            """Rebuild missing_ranges QR from current metadata + chunks (same as automatic updates)."""
             recompute_control_bgr()
-            if control_bgr is not None:
-                last_control_emit = now
-                first_control_emitted = True
-                logger.info("Control QR updated after redundant/loop confirmation")
+            with state_lock:
+                has_qr = control_bgr is not None
+            logger.info(
+                "Manual control QR refresh — %s",
+                "missing_ranges QR regenerated from current state"
+                if has_qr
+                else "no control QR (awaiting metadata or all chunks received)",
+            )
+
+        def missing_footer() -> tuple[str, str]:
+            title = "Missing (inclusive ranges)"
+            with state_lock:
+                m = metadata
+                have = set(chunks.keys())
+            if m is None:
+                return title, "Waiting for file metadata"
+            ntot = m["chunks"]
+            if ntot <= 0:
+                return title, "—"
+            miss = missing_indices_for_file(ntot, have)
+            if not miss:
+                return title, "None (complete)"
+            r = indices_to_ranges(miss, MAX_MISSING_RANGE_ENTRIES)
+            return title, format_inclusive_chunk_ranges(r)
+
+        btn_bounds: list[tuple[int, int, int, int] | None] = [None]
+        mouse_setup = [False]
+
+        def on_mouse(event: int, x: int, y: int, flags: int, param: object) -> None:
+            if event != cv2.EVENT_LBUTTONDOWN:
+                return
+            b = btn_bounds[0]
+            if b is None:
+                return
+            x0, y0, bw, bh = b
+            if x0 <= x < x0 + bw and y0 <= y < y0 + bh:
+                manual_refresh_control()
 
         exit_code: int | None = None
         while True:
@@ -466,7 +458,7 @@ def _run_bidirectional(
                 exit_code = 1
                 break
 
-            data = _decode_left_half(detector, frame)
+            data = _decode_frame_safe(detector, frame)
             if data:
                 try:
                     obj = json.loads(data)
@@ -505,10 +497,9 @@ def _run_bidirectional(
                                     logger.error("Echo QR failed: %s", e)
                                     return 1
                                 handshake_done = False
-                                first_control_emitted = False
                                 control_bgr = None
-                                confirm_deadline = None
-                                issues_during_arm = 0
+                                consecutive_repeat_streak = 0
+                                last_counted_repeat_order = None
                                 last_max_order = None
                                 logger.info(
                                     "Metadata changed: %s, %s chunks, sha256=%s…",
@@ -526,51 +517,62 @@ def _run_bidirectional(
                     if parsed is not None and meta_ref is not None:
                         order, chunk_data = parsed
                         ntot = meta_ref["chunks"]
-                        if order >= ntot:
-                            continue
-                        with state_lock:
-                            had = order in chunks
-                            dup = had
-                            loop = (
-                                last_max_order is not None
-                                and order < last_max_order
-                                and len(chunks) < ntot
-                            )
-                            chunks[order] = chunk_data
-                            if last_max_order is None or order > last_max_order:
-                                last_max_order = order
-                            new_index = not had
-                        if new_index:
-                            _log_data_chunk_progress(meta_ref, chunks)
-                        if not handshake_done and new_index:
-                            handshake_done = True
-                            logger.info(
-                                "Handshake step 3/3: Scanned sender data_chunk — "
-                                "handshake complete; receiving remaining chunks / control flow."
-                            )
-                            emit_control_immediate("after handshake")
-                        elif handshake_done and new_index:
-                            emit_control_immediate("chunk progress")
-                        if handshake_done and (dup or loop):
-                            if confirm_deadline is None:
-                                confirm_deadline = (
-                                    time.monotonic() + CONTROL_METADATA_CONFIRMATION_SEC
+                        # Do not `continue` here: a bad/stale chunk QR in view must not skip
+                        # the completion check and finalize path at the bottom of the loop.
+                        if order < ntot:
+                            with state_lock:
+                                had = order in chunks
+                                dup = had
+                                chunks[order] = chunk_data
+                                if last_max_order is None or order > last_max_order:
+                                    last_max_order = order
+                                new_index = not had
+                            if new_index:
+                                _log_data_chunk_progress(meta_ref, chunks)
+                            if not handshake_done and new_index:
+                                handshake_done = True
+                                logger.info(
+                                    "Handshake step 3/3: Scanned sender data_chunk — "
+                                    "handshake complete; receiving remaining chunks / control flow."
                                 )
-                                issues_during_arm = 0
-                            issues_during_arm += 1
-
-            try_emit_after_confirm()
+                                emit_control_immediate("after handshake")
+                            elif handshake_done:
+                                if dup:
+                                    if order != last_counted_repeat_order:
+                                        consecutive_repeat_streak += 1
+                                        last_counted_repeat_order = order
+                                    if (
+                                        consecutive_repeat_streak
+                                        >= CONTROL_METADATA_CONSECUTIVE_REPEATS
+                                    ):
+                                        emit_control_immediate(
+                                            "%s repeated chunks with distinct order numbers "
+                                            "(same order in a row counts once)"
+                                            % CONTROL_METADATA_CONSECUTIVE_REPEATS
+                                        )
+                                        consecutive_repeat_streak = 0
+                                        last_counted_repeat_order = None
+                                else:
+                                    consecutive_repeat_streak = 0
+                                    last_counted_repeat_order = None
 
             with state_lock:
                 meta_ref = metadata
                 if meta_ref is not None:
                     ntot = meta_ref["chunks"]
                     if ntot == 0:
+                        logger.info("All data chunks received (0 chunks); assembling file…")
                         exit_code = _finalize(
                             meta_ref, {}, args.output_dir.resolve(), cache_path
                         )
                         break
-                    if len(chunks) == ntot and set(chunks) == set(range(ntot)):
+                    miss = missing_indices_for_file(ntot, set(chunks))
+                    if not miss:
+                        logger.info(
+                            "All %s data chunks received (indices 0..%s); assembling file…",
+                            ntot,
+                            ntot - 1,
+                        )
                         exit_code = _finalize(
                             meta_ref, chunks, args.output_dir.resolve(), cache_path
                         )
@@ -581,8 +583,37 @@ def _run_bidirectional(
                 right = echo_bgr
             if right is None:
                 right = np.full((480, 480, 3), 240, dtype=np.uint8)
-            display = _compose_split(frame, right, 480)
-            cv2.imshow(window, display)
+            ft, fb = missing_footer()
+            display = compose_bidirectional_layout(
+                frame,
+                right,
+                target_h=480,
+                footer_title=ft,
+                footer_body=fb,
+            )
+            if not mouse_setup[0]:
+                cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+                cv2.setMouseCallback(window, on_mouse)
+                mouse_setup[0] = True
+            disp = display.copy()
+            dh, dw = disp.shape[:2]
+            btn_w, btn_h = 158, 28
+            bx = max(0, dw - btn_w - 8)
+            by = max(0, dh - btn_h - 6)
+            btn_bounds[0] = (bx, by, btn_w, btn_h)
+            cv2.rectangle(disp, (bx, by), (bx + btn_w - 1, by + btn_h - 1), (55, 75, 105), -1)
+            cv2.rectangle(disp, (bx, by), (bx + btn_w - 1, by + btn_h - 1), (200, 210, 230), 1)
+            cv2.putText(
+                disp,
+                "Refresh control",
+                (bx + 8, by + 19),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (245, 245, 250),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(window, disp)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 logger.info("Quit without completing transfer")
                 exit_code = 1

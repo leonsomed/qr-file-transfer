@@ -77,6 +77,24 @@ def missing_indices_for_file(metadata_chunks: int, have: set[int]) -> set[int]:
     return set(range(n)) - have
 
 
+def full_file_chunk_ranges(chunk_count: int) -> list[list[int]]:
+    if chunk_count <= 0:
+        return []
+    return [[0, chunk_count - 1]]
+
+
+def format_inclusive_chunk_ranges(ranges: list[list[int]]) -> str:
+    if not ranges:
+        return "—"
+    parts: list[str] = []
+    for ab in ranges:
+        if not isinstance(ab, (list, tuple)) or len(ab) != 2:
+            continue
+        a, b = int(ab[0]), int(ab[1])
+        parts.append(f"{a}-{b}" if a != b else str(a))
+    return ", ".join(parts) if parts else "—"
+
+
 def normalize_missing_ranges_payload(
     obj: dict,
     expected_sha256_lower: str,

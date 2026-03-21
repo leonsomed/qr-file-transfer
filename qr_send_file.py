@@ -19,7 +19,14 @@ import cv2
 import numpy as np
 from qrcode.exceptions import DataOverflowError
 
-from qr_transfer_codec import json_compact, normalize_missing_ranges_payload, ranges_to_indices
+from qr_transfer_codec import (
+    format_inclusive_chunk_ranges,
+    full_file_chunk_ranges,
+    json_compact,
+    normalize_missing_ranges_payload,
+    ranges_to_indices,
+)
+from qr_transfer_display import compose_bidirectional_layout
 from qr_transfer_constants import (
     CHUNK_HEX_CHARS_DEFAULT,
     CHUNK_HEX_CHARS_MAX,
@@ -30,13 +37,40 @@ from qr_transfer_constants import (
     MAX_FILE_BYTES,
     METADATA_TYPE,
 )
-from qr_transfer_qr import encode_qr_bgr, encode_qr_bgr_indexed, make_qr_bgr, resize_to_height
+from qr_transfer_qr import encode_qr_bgr, encode_qr_bgr_indexed, make_qr_bgr
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 CHUNK_HEX_CHARS = CHUNK_HEX_CHARS_DEFAULT
 MIN_CHUNKS_FOR_PROCESS_POOL = 8
+
+
+def _qr_strings_from_frame(detector: cv2.QRCodeDetector, frame: np.ndarray) -> list[str]:
+    """All decoded QR strings in the frame (peer may show metadata, control, or both)."""
+    out: list[str] = []
+    if frame is None or frame.size == 0:
+        return out
+    decode_multi = getattr(detector, "detectAndDecodeMulti", None)
+    ret, infos = False, None
+    if decode_multi is not None:
+        try:
+            ret, infos, *_ = decode_multi(frame)
+        except cv2.error:
+            ret, infos = False, None
+    if ret and infos is not None:
+        seq = infos if isinstance(infos, (list, tuple)) else (infos,)
+        for item in seq:
+            if isinstance(item, str) and item:
+                out.append(item)
+    if not out:
+        try:
+            s, _, _ = detector.detectAndDecode(frame)
+        except cv2.error:
+            return out
+        if s:
+            out.append(s)
+    return out
 
 
 class QuitRequest(Exception):
@@ -112,6 +146,8 @@ def _wait_for_chunk_ready(
     window: str,
     idle_bgr: np.ndarray,
     cap: cv2.VideoCapture | None = None,
+    idle_caption: str | None = None,
+    get_bidir_footer: Callable[[], tuple[str, str, str | None]] | None = None,
 ) -> np.ndarray:
     placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
     last_cam = placeholder
@@ -127,9 +163,23 @@ def _wait_for_chunk_ready(
             ok, frame = cap.read()
             if ok:
                 last_cam = frame
-            cv2.imshow(window, _compose_bidir_display(last_cam, idle_bgr))
+            layout_kw: dict = {}
+            if get_bidir_footer is not None:
+                ft, fb, fh = get_bidir_footer()
+                layout_kw["footer_title"] = ft
+                layout_kw["footer_body"] = fb
+                layout_kw["footer_highlight"] = fh
+            cv2.imshow(
+                window,
+                compose_bidirectional_layout(last_cam, idle_bgr, **layout_kw),
+            )
         else:
-            cv2.imshow(window, idle_bgr)
+            vis = (
+                _oneway_qr_with_caption_bar(idle_bgr, idle_caption)
+                if idle_caption
+                else idle_bgr
+            )
+            cv2.imshow(window, vis)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             raise QuitRequest()
         time.sleep(0.001)
@@ -143,24 +193,27 @@ def _log_encoding_failure(exc: EncodingFailed) -> None:
         logger.error("Chunk encoding failed: %s", cause)
 
 
-def _compose_bidir_display(left_bgr: np.ndarray, right_qr_bgr: np.ndarray, target_h: int = 480) -> np.ndarray:
-    """Camera / preview on the left, outbound QR on the right (matches receiver layout)."""
-    lh = resize_to_height(left_bgr, target_h)
-    rh = resize_to_height(right_qr_bgr, target_h)
-    h = max(lh.shape[0], rh.shape[0])
-    lh = resize_to_height(lh, h)
-    rh = resize_to_height(rh, h)
-    w = lh.shape[1] + rh.shape[1]
-    out = np.zeros((h, w, 3), dtype=np.uint8)
-    out[:, : lh.shape[1]] = lh
-    out[:, lh.shape[1] :] = rh
-    return out
+def _oneway_qr_with_caption_bar(bgr: np.ndarray, caption: str) -> np.ndarray:
+    """One-way mode has no camera feed; draw caption on a bar above the QR (not on the code)."""
+    h_qr, w = bgr.shape[:2]
+    band_h = max(36, int(h_qr * 0.09))
+    bar = np.full((band_h, w, 3), 28, dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.5, min(1.05, w / 480.0))
+    thickness = max(1, int(round(scale * 2)))
+    (tw, th), baseline = cv2.getTextSize(caption, font, scale, thickness)
+    x = max(4, (w - tw) // 2)
+    y = min(band_h - 4, (band_h + th) // 2 + baseline // 2)
+    cv2.putText(bar, caption, (x, y), font, scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    cv2.putText(bar, caption, (x, y), font, scale, (220, 220, 220), thickness, cv2.LINE_AA)
+    return np.vstack([bar, bgr])
 
 
-def _show_code(window: str, bgr: np.ndarray, dwell: float) -> bool:
+def _show_code(window: str, bgr: np.ndarray, dwell: float, caption: str | None = None) -> bool:
     deadline = time.perf_counter() + dwell
+    vis = _oneway_qr_with_caption_bar(bgr, caption) if caption else bgr
     while time.perf_counter() < deadline:
-        cv2.imshow(window, bgr)
+        cv2.imshow(window, vis)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             return False
     return True
@@ -174,7 +227,8 @@ def _show_code_bidirectional(
     detector: cv2.QRCodeDetector,
     digest_lower: str,
     chunk_count: int,
-    on_missing_ranges: Callable[[list[list[int]]], None],
+    on_missing_ranges: Callable[[list[list[int]]], bool],
+    get_bidir_footer: Callable[[], tuple[str, str, str | None]],
 ) -> bool:
     placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
     last_cam = placeholder
@@ -196,7 +250,17 @@ def _show_code_bidirectional(
                     norm = normalize_missing_ranges_payload(obj, digest_lower, chunk_count)
                     if norm is not None:
                         on_missing_ranges(norm)
-        cv2.imshow(window, _compose_bidir_display(last_cam, bgr))
+        ft, fb, fh = get_bidir_footer()
+        cv2.imshow(
+            window,
+            compose_bidirectional_layout(
+                last_cam,
+                bgr,
+                footer_title=ft,
+                footer_body=fb,
+                footer_highlight=fh,
+            ),
+        )
         if cv2.waitKey(1) & 0xFF == ord("q"):
             return False
     return True
@@ -213,19 +277,25 @@ def _run_oneway_loop(
 ) -> int:
     try:
         while True:
-            if not _show_code(window, meta_bgr, args.dwell):
+            if not _show_code(window, meta_bgr, args.dwell, caption="metadata"):
                 break
             for i in range(n_chunks):
                 try:
                     bgr = _wait_for_chunk_ready(
-                        i, chunk_results, result_lock, error_box, window, meta_bgr
+                        i,
+                        chunk_results,
+                        result_lock,
+                        error_box,
+                        window,
+                        meta_bgr,
+                        idle_caption="metadata",
                     )
                 except QuitRequest:
                     return 0
                 except EncodingFailed as e:
                     _log_encoding_failure(e)
                     return 1
-                if not _show_code(window, bgr, args.dwell):
+                if not _show_code(window, bgr, args.dwell, caption=f"order {i}"):
                     return 0
     finally:
         cv2.destroyAllWindows()
@@ -247,70 +317,126 @@ def _run_bidirectional_loop(
     detector = cv2.QRCodeDetector()
     pending: set[int] = set(range(chunk_count))
     pending_lock = threading.Lock()
+    peer_ranges_norm: list[list[int]] | None = None
+    outbound_highlight_cell: list[str | None] = [None]
 
-    def apply_ranges(norm_ranges: list[list[int]]) -> None:
+    def sending_footer() -> tuple[str, str, str | None]:
+        title = "Sending (inclusive ranges)"
+        if chunk_count <= 0:
+            body = "—"
+        elif peer_ranges_norm is None:
+            body = format_inclusive_chunk_ranges(full_file_chunk_ranges(chunk_count))
+        else:
+            body = format_inclusive_chunk_ranges(peer_ranges_norm)
+        return title, body, outbound_highlight_cell[0]
+
+    def apply_ranges(norm_ranges: list[list[int]]) -> bool:
+        nonlocal peer_ranges_norm
         idx = ranges_to_indices(norm_ranges)
         idx = {i for i in idx if 0 <= i < chunk_count}
         if not idx:
             logger.warning("Ignoring empty missing_ranges from peer")
-            return
+            return False
         with pending_lock:
             pending.clear()
             pending.update(idx)
+        peer_ranges_norm = [[int(a), int(b)] for a, b in norm_ranges]
         logger.info("Peer requested re-send of chunk indices: %s (count %s)", sorted(pending)[:20], len(pending))
+        return True
 
     try:
         logger.info(
-            "Handshake step 1/2: Waiting to scan the peer's file_metadata QR "
-            "(decoded string must match ours). Our metadata QR is on the right; "
-            "point the camera at the receiver's screen."
+            "Handshake step 1/2: Point the camera at the receiver — scan either their "
+            "file_metadata QR (exact JSON match) or a missing_ranges control QR for our file "
+            "(sha256 match). Either completes the handshake."
         )
         placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
         last_cam = placeholder
+        outbound_highlight_cell[0] = "metadata"
         while True:
             ok, frame = cap.read()
             if not ok:
                 logger.error("Camera frame grab failed")
                 return 1
             last_cam = frame
-            try:
-                data, _, _ = detector.detectAndDecode(frame)
-            except cv2.error:
-                data = ""
-            if data == metadata_json:
+            payloads = _qr_strings_from_frame(detector, frame)
+            if metadata_json in payloads:
                 logger.info(
                     "Handshake step 2/2: Scanned matching file_metadata from peer — "
                     "handshake OK; starting metadata + chunk send loop."
                 )
                 break
-            cv2.imshow(window, _compose_bidir_display(last_cam, meta_bgr))
+            handshake_via_control = False
+            for data in payloads:
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                norm = normalize_missing_ranges_payload(obj, digest_lower, chunk_count)
+                if norm is not None and apply_ranges(norm):
+                    logger.info(
+                        "Handshake step 2/2: Scanned peer missing_ranges for our file first — "
+                        "handshake OK without metadata echo; starting send loop."
+                    )
+                    handshake_via_control = True
+                    break
+            if handshake_via_control:
+                break
+            ft, fb, fh = sending_footer()
+            cv2.imshow(
+                window,
+                compose_bidirectional_layout(
+                    last_cam,
+                    meta_bgr,
+                    footer_title=ft,
+                    footer_body=fb,
+                    footer_highlight=fh,
+                ),
+            )
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 return 0
 
         logger.info(
-            "Handshake finished — cycling outbound metadata and data_chunk QRs; "
-            "watching camera for peer missing_ranges."
+            "Handshake finished — showing file_metadata QR once, then data_chunk loop only "
+            "(metadata is not repeated between chunk passes); watching camera for missing_ranges."
         )
+        outbound_highlight_cell[0] = "metadata"
+        if not _show_code_bidirectional(
+            window,
+            meta_bgr,
+            args.dwell,
+            cap,
+            detector,
+            digest_lower,
+            chunk_count,
+            apply_ranges,
+            sending_footer,
+        ):
+            return 0
+        if chunk_count <= 0:
+            return 0
+        # Re-fetch pending after each chunk: apply_ranges() may run anytime during dwell /
+        # display and must not be ignored until the current `for` loop finishes.
         while True:
-            if not _show_code_bidirectional(
-                window,
-                meta_bgr,
-                args.dwell,
-                cap,
-                detector,
-                digest_lower,
-                chunk_count,
-                apply_ranges,
-            ):
-                break
             with pending_lock:
                 todo = sorted(pending)
             if not todo and chunk_count > 0:
                 logger.warning("Pending chunks empty; showing full set until peer sends ranges")
+                peer_ranges_norm = None
                 with pending_lock:
                     pending = set(range(chunk_count))
                 todo = list(range(chunk_count))
+            if not todo:
+                continue
+            snap = tuple(todo)
+            peer_updated_pending = False
             for i in todo:
+                with pending_lock:
+                    if i not in pending:
+                        continue
+                outbound_highlight_cell[0] = f"order {i}"
                 try:
                     bgr = _wait_for_chunk_ready(
                         i,
@@ -320,12 +446,24 @@ def _run_bidirectional_loop(
                         window,
                         meta_bgr,
                         cap,
+                        get_bidir_footer=sending_footer,
                     )
                 except QuitRequest:
                     return 0
                 except EncodingFailed as e:
                     _log_encoding_failure(e)
                     return 1
+                with pending_lock:
+                    cur = tuple(sorted(pending))
+                    still_want = i in pending
+                if cur != snap or not still_want:
+                    logger.info(
+                        "Peer missing_ranges updated — resuming with new indices "
+                        "(not waiting to finish the previous list)."
+                    )
+                    peer_updated_pending = True
+                    break
+                outbound_highlight_cell[0] = f"order {i}"
                 if not _show_code_bidirectional(
                     window,
                     bgr,
@@ -335,8 +473,20 @@ def _run_bidirectional_loop(
                     digest_lower,
                     chunk_count,
                     apply_ranges,
+                    sending_footer,
                 ):
                     return 0
+                with pending_lock:
+                    cur = tuple(sorted(pending))
+                if cur != snap:
+                    logger.info(
+                        "Peer missing_ranges updated — resuming with new indices "
+                        "(not waiting to finish the previous list)."
+                    )
+                    peer_updated_pending = True
+                    break
+            if peer_updated_pending:
+                continue
     finally:
         cap.release()
         cv2.destroyAllWindows()
