@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import hashlib
 import json
 import logging
@@ -16,9 +17,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import qrcode
 from qrcode.exceptions import DataOverflowError
 
+from qr_transfer_codec import json_compact, normalize_missing_ranges_payload, ranges_to_indices
 from qr_transfer_constants import (
     CHUNK_HEX_CHARS_DEFAULT,
     CHUNK_HEX_CHARS_MAX,
@@ -29,14 +30,12 @@ from qr_transfer_constants import (
     MAX_FILE_BYTES,
     METADATA_TYPE,
 )
+from qr_transfer_qr import encode_qr_bgr, encode_qr_bgr_indexed, make_qr_bgr, resize_to_height
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-# Tunable default; overridden by CLI --chunk-chars when provided.
 CHUNK_HEX_CHARS = CHUNK_HEX_CHARS_DEFAULT
-
-# Use worker processes when chunk count is high enough to amortize pool startup.
 MIN_CHUNKS_FOR_PROCESS_POOL = 8
 
 
@@ -48,45 +47,16 @@ class EncodingFailed(Exception):
     """Background encoder failed; original exception is __cause__."""
 
 
-def _json_compact(obj: object) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-
-
-def _matrix_to_bgr(qr: qrcode.QRCode) -> np.ndarray:
-    """Rasterize QR modules to a BGR uint8 image (white background, black modules)."""
-    mat = np.asarray(qr.get_matrix(), dtype=np.uint8)
-    box = qr.box_size
-    scaled = np.kron(mat, np.ones((box, box), dtype=np.uint8))
-    bgr = np.full((*scaled.shape, 3), 255, dtype=np.uint8)
-    bgr[scaled.astype(bool)] = (0, 0, 0)
-    return bgr
-
-
-def _encode_qr_bgr(payload: str) -> np.ndarray:
-    """Encode payload to a QR image. Top-level for ProcessPoolExecutor pickling."""
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=8,
-        border=2,
-    )
-    qr.add_data(payload)
-    qr.make(fit=True)
-    return _matrix_to_bgr(qr)
-
-
-def _encode_qr_bgr_indexed(item: tuple[int, str]) -> tuple[int, np.ndarray]:
-    """Same as _encode_qr_bgr but returns index for ordered reassembly (picklable)."""
-    idx, payload = item
-    return idx, _encode_qr_bgr(payload)
-
-
-def _make_qr_bgr(payload: str) -> np.ndarray:
-    try:
-        return _encode_qr_bgr(payload)
-    except DataOverflowError as e:
-        logger.error("QR payload too large; try a smaller --chunk-chars: %s", e)
-        raise SystemExit(1) from e
+def _chunk_payload(
+    order: int,
+    piece: str,
+    digest: str,
+    bidirectional: bool,
+) -> str:
+    obj: dict = {"type": CHUNK_TYPE, "order": order, "data": piece}
+    if bidirectional:
+        obj["sha256"] = digest
+    return json_compact(obj)
 
 
 def _chunk_encoding_worker(
@@ -95,7 +65,6 @@ def _chunk_encoding_worker(
     result_lock: threading.Lock,
     error_box: list[BaseException | None],
 ) -> None:
-    """Encode chunk QRs in a background thread; store by index as each finishes."""
     try:
         if not payloads:
             return
@@ -109,7 +78,7 @@ def _chunk_encoding_worker(
             )
             with ProcessPoolExecutor(max_workers=workers) as pool:
                 futures = [
-                    pool.submit(_encode_qr_bgr_indexed, (i, p)) for i, p in enumerate(payloads)
+                    pool.submit(encode_qr_bgr_indexed, (i, p)) for i, p in enumerate(payloads)
                 ]
                 completed = 0
                 for fut in as_completed(futures):
@@ -125,7 +94,7 @@ def _chunk_encoding_worker(
         else:
             total = len(payloads)
             for i, p in enumerate(payloads):
-                bgr = _encode_qr_bgr(p)
+                bgr = encode_qr_bgr(p)
                 with result_lock:
                     chunk_results[i] = bgr
                 logger.info("Chunk QR encoding progress: %s/%s complete", i + 1, total)
@@ -142,8 +111,10 @@ def _wait_for_chunk_ready(
     error_box: list[BaseException | None],
     window: str,
     idle_bgr: np.ndarray,
+    cap: cv2.VideoCapture | None = None,
 ) -> np.ndarray:
-    """Block until chunk ``index`` is encoded, encoding error, or user presses 'q'."""
+    placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+    last_cam = placeholder
     while True:
         with result_lock:
             err = error_box[0]
@@ -152,7 +123,13 @@ def _wait_for_chunk_ready(
             bgr = chunk_results.get(index)
             if bgr is not None:
                 return bgr
-        cv2.imshow(window, idle_bgr)
+        if cap is not None:
+            ok, frame = cap.read()
+            if ok:
+                last_cam = frame
+            cv2.imshow(window, _compose_bidir_display(last_cam, idle_bgr))
+        else:
+            cv2.imshow(window, idle_bgr)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             raise QuitRequest()
         time.sleep(0.001)
@@ -166,14 +143,204 @@ def _log_encoding_failure(exc: EncodingFailed) -> None:
         logger.error("Chunk encoding failed: %s", cause)
 
 
+def _compose_bidir_display(left_bgr: np.ndarray, right_qr_bgr: np.ndarray, target_h: int = 480) -> np.ndarray:
+    """Camera / preview on the left, outbound QR on the right (matches receiver layout)."""
+    lh = resize_to_height(left_bgr, target_h)
+    rh = resize_to_height(right_qr_bgr, target_h)
+    h = max(lh.shape[0], rh.shape[0])
+    lh = resize_to_height(lh, h)
+    rh = resize_to_height(rh, h)
+    w = lh.shape[1] + rh.shape[1]
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    out[:, : lh.shape[1]] = lh
+    out[:, lh.shape[1] :] = rh
+    return out
+
+
 def _show_code(window: str, bgr: np.ndarray, dwell: float) -> bool:
-    """Show QR until dwell elapses. Returns False if user pressed 'q'."""
     deadline = time.perf_counter() + dwell
     while time.perf_counter() < deadline:
         cv2.imshow(window, bgr)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             return False
     return True
+
+
+def _show_code_bidirectional(
+    window: str,
+    bgr: np.ndarray,
+    dwell: float,
+    cap: cv2.VideoCapture,
+    detector: cv2.QRCodeDetector,
+    digest_lower: str,
+    chunk_count: int,
+    on_missing_ranges: Callable[[list[list[int]]], None],
+) -> bool:
+    placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+    last_cam = placeholder
+    deadline = time.perf_counter() + dwell
+    while time.perf_counter() < deadline:
+        ok, frame = cap.read()
+        if ok:
+            last_cam = frame
+            try:
+                data, _, _ = detector.detectAndDecode(frame)
+            except cv2.error:
+                data = ""
+            if data:
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    obj = None
+                if isinstance(obj, dict):
+                    norm = normalize_missing_ranges_payload(obj, digest_lower, chunk_count)
+                    if norm is not None:
+                        on_missing_ranges(norm)
+        cv2.imshow(window, _compose_bidir_display(last_cam, bgr))
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            return False
+    return True
+
+
+def _run_oneway_loop(
+    window: str,
+    meta_bgr: np.ndarray,
+    args: argparse.Namespace,
+    n_chunks: int,
+    chunk_results: dict[int, np.ndarray],
+    result_lock: threading.Lock,
+    error_box: list[BaseException | None],
+) -> int:
+    try:
+        while True:
+            if not _show_code(window, meta_bgr, args.dwell):
+                break
+            for i in range(n_chunks):
+                try:
+                    bgr = _wait_for_chunk_ready(
+                        i, chunk_results, result_lock, error_box, window, meta_bgr
+                    )
+                except QuitRequest:
+                    return 0
+                except EncodingFailed as e:
+                    _log_encoding_failure(e)
+                    return 1
+                if not _show_code(window, bgr, args.dwell):
+                    return 0
+    finally:
+        cv2.destroyAllWindows()
+    return 0
+
+
+def _run_bidirectional_loop(
+    window: str,
+    cap: cv2.VideoCapture,
+    meta_bgr: np.ndarray,
+    metadata_json: str,
+    digest_lower: str,
+    chunk_count: int,
+    args: argparse.Namespace,
+    chunk_results: dict[int, np.ndarray],
+    result_lock: threading.Lock,
+    error_box: list[BaseException | None],
+) -> int:
+    detector = cv2.QRCodeDetector()
+    pending: set[int] = set(range(chunk_count))
+    pending_lock = threading.Lock()
+
+    def apply_ranges(norm_ranges: list[list[int]]) -> None:
+        idx = ranges_to_indices(norm_ranges)
+        idx = {i for i in idx if 0 <= i < chunk_count}
+        if not idx:
+            logger.warning("Ignoring empty missing_ranges from peer")
+            return
+        with pending_lock:
+            pending.clear()
+            pending.update(idx)
+        logger.info("Peer requested re-send of chunk indices: %s (count %s)", sorted(pending)[:20], len(pending))
+
+    try:
+        logger.info(
+            "Handshake step 1/2: Waiting to scan the peer's file_metadata QR "
+            "(decoded string must match ours). Our metadata QR is on the right; "
+            "point the camera at the receiver's screen."
+        )
+        placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+        last_cam = placeholder
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                logger.error("Camera frame grab failed")
+                return 1
+            last_cam = frame
+            try:
+                data, _, _ = detector.detectAndDecode(frame)
+            except cv2.error:
+                data = ""
+            if data == metadata_json:
+                logger.info(
+                    "Handshake step 2/2: Scanned matching file_metadata from peer — "
+                    "handshake OK; starting metadata + chunk send loop."
+                )
+                break
+            cv2.imshow(window, _compose_bidir_display(last_cam, meta_bgr))
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                return 0
+
+        logger.info(
+            "Handshake finished — cycling outbound metadata and data_chunk QRs; "
+            "watching camera for peer missing_ranges."
+        )
+        while True:
+            if not _show_code_bidirectional(
+                window,
+                meta_bgr,
+                args.dwell,
+                cap,
+                detector,
+                digest_lower,
+                chunk_count,
+                apply_ranges,
+            ):
+                break
+            with pending_lock:
+                todo = sorted(pending)
+            if not todo and chunk_count > 0:
+                logger.warning("Pending chunks empty; showing full set until peer sends ranges")
+                with pending_lock:
+                    pending = set(range(chunk_count))
+                todo = list(range(chunk_count))
+            for i in todo:
+                try:
+                    bgr = _wait_for_chunk_ready(
+                        i,
+                        chunk_results,
+                        result_lock,
+                        error_box,
+                        window,
+                        meta_bgr,
+                        cap,
+                    )
+                except QuitRequest:
+                    return 0
+                except EncodingFailed as e:
+                    _log_encoding_failure(e)
+                    return 1
+                if not _show_code_bidirectional(
+                    window,
+                    bgr,
+                    args.dwell,
+                    cap,
+                    detector,
+                    digest_lower,
+                    chunk_count,
+                    apply_ranges,
+                ):
+                    return 0
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+    return 0
 
 
 def main() -> int:
@@ -184,6 +351,18 @@ def main() -> int:
         "file",
         type=Path,
         help="Path to the file to send",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("one-way", "bidirectional"),
+        default="one-way",
+        help="one-way: display only. bidirectional: camera + handshake + peer missing_ranges",
+    )
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=0,
+        help="Camera index for bidirectional mode (default: 0)",
     )
     parser.add_argument(
         "--chunk-chars",
@@ -233,6 +412,7 @@ def main() -> int:
 
     raw = path.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
+    digest_lower = digest.lower()
     hex_body = raw.hex()
 
     chunks: list[str] = []
@@ -246,14 +426,15 @@ def main() -> int:
         "sha256": digest,
         "chunks": len(chunks),
     }
-    metadata_json = _json_compact(metadata)
+    metadata_json = json_compact(metadata)
+    bidir = args.mode == "bidirectional"
     try:
-        meta_bgr = _make_qr_bgr(metadata_json)
-    except SystemExit:
+        meta_bgr = make_qr_bgr(metadata_json)
+    except DataOverflowError:
         return 1
 
     chunk_payloads = [
-        _json_compact({"type": CHUNK_TYPE, "order": order, "data": piece})
+        _chunk_payload(order, piece, digest_lower, bidir)
         for order, piece in enumerate(chunks)
     ]
 
@@ -270,35 +451,39 @@ def main() -> int:
 
     window = "QR send (q to quit)"
     logger.info(
-        "Sending %s (%s bytes), %s data chunks, chunk_chars=%s, dwell=%ss",
+        "Sending %s (%s bytes), %s data chunks, mode=%s, chunk_chars=%s, dwell=%ss",
         path.name,
         size,
         len(chunks),
+        args.mode,
         CHUNK_HEX_CHARS,
         args.dwell,
     )
 
     n_chunks = len(chunk_payloads)
-    try:
-        while True:
-            if not _show_code(window, meta_bgr, args.dwell):
-                break
-            for i in range(n_chunks):
-                try:
-                    bgr = _wait_for_chunk_ready(
-                        i, chunk_results, result_lock, error_box, window, meta_bgr
-                    )
-                except QuitRequest:
-                    return 0
-                except EncodingFailed as e:
-                    _log_encoding_failure(e)
-                    return 1
-                if not _show_code(window, bgr, args.dwell):
-                    return 0
-    finally:
-        cv2.destroyAllWindows()
 
-    return 0
+    if args.mode == "one-way":
+        return _run_oneway_loop(
+            window, meta_bgr, args, n_chunks, chunk_results, result_lock, error_box
+        )
+
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        logger.error("Could not open camera %s", args.camera)
+        return 1
+
+    return _run_bidirectional_loop(
+        window,
+        cap,
+        meta_bgr,
+        metadata_json,
+        digest_lower,
+        n_chunks,
+        args,
+        chunk_results,
+        result_lock,
+        error_box,
+    )
 
 
 if __name__ == "__main__":
