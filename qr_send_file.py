@@ -7,8 +7,11 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import sys
+import threading
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -33,30 +36,134 @@ logger = logging.getLogger(__name__)
 # Tunable default; overridden by CLI --chunk-chars when provided.
 CHUNK_HEX_CHARS = CHUNK_HEX_CHARS_DEFAULT
 
+# Use worker processes when chunk count is high enough to amortize pool startup.
+MIN_CHUNKS_FOR_PROCESS_POOL = 8
+
+
+class QuitRequest(Exception):
+    """User pressed 'q' while waiting for a chunk to finish encoding."""
+
+
+class EncodingFailed(Exception):
+    """Background encoder failed; original exception is __cause__."""
+
 
 def _json_compact(obj: object) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
-def _pil_to_bgr(img) -> np.ndarray:
-    rgb = np.array(img.convert("RGB"))
-    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+def _matrix_to_bgr(qr: qrcode.QRCode) -> np.ndarray:
+    """Rasterize QR modules to a BGR uint8 image (white background, black modules)."""
+    mat = np.asarray(qr.get_matrix(), dtype=np.uint8)
+    box = qr.box_size
+    scaled = np.kron(mat, np.ones((box, box), dtype=np.uint8))
+    bgr = np.full((*scaled.shape, 3), 255, dtype=np.uint8)
+    bgr[scaled.astype(bool)] = (0, 0, 0)
+    return bgr
 
 
-def _make_qr_bgr(payload: str) -> np.ndarray:
+def _encode_qr_bgr(payload: str) -> np.ndarray:
+    """Encode payload to a QR image. Top-level for ProcessPoolExecutor pickling."""
     qr = qrcode.QRCode(
-        version=40,
+        version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=8,
+        box_size=6,
         border=2,
     )
     qr.add_data(payload)
+    qr.make(fit=True)
+    return _matrix_to_bgr(qr)
+
+
+def _encode_qr_bgr_indexed(item: tuple[int, str]) -> tuple[int, np.ndarray]:
+    """Same as _encode_qr_bgr but returns index for ordered reassembly (picklable)."""
+    idx, payload = item
+    return idx, _encode_qr_bgr(payload)
+
+
+def _make_qr_bgr(payload: str) -> np.ndarray:
     try:
-        qr.make(fit=True)
+        return _encode_qr_bgr(payload)
     except DataOverflowError as e:
         logger.error("QR payload too large; try a smaller --chunk-chars: %s", e)
         raise SystemExit(1) from e
-    return _pil_to_bgr(qr.make_image(fill_color="black", back_color="white"))
+
+
+def _chunk_encoding_worker(
+    payloads: list[str],
+    chunk_results: dict[int, np.ndarray],
+    result_lock: threading.Lock,
+    error_box: list[BaseException | None],
+) -> None:
+    """Encode chunk QRs in a background thread; store by index as each finishes."""
+    try:
+        if not payloads:
+            return
+        if len(payloads) >= MIN_CHUNKS_FOR_PROCESS_POOL:
+            workers = max(1, min(len(payloads), os.cpu_count() or 4))
+            total = len(payloads)
+            logger.info(
+                "Encoding %s chunk QRs in background (%s worker processes)",
+                total,
+                workers,
+            )
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(_encode_qr_bgr_indexed, (i, p)) for i, p in enumerate(payloads)
+                ]
+                completed = 0
+                for fut in as_completed(futures):
+                    idx, bgr = fut.result()
+                    with result_lock:
+                        chunk_results[idx] = bgr
+                    completed += 1
+                    logger.info(
+                        "Chunk QR workers progress: %s/%s complete",
+                        completed,
+                        total,
+                    )
+        else:
+            total = len(payloads)
+            for i, p in enumerate(payloads):
+                bgr = _encode_qr_bgr(p)
+                with result_lock:
+                    chunk_results[i] = bgr
+                logger.info("Chunk QR encoding progress: %s/%s complete", i + 1, total)
+    except BaseException as e:
+        with result_lock:
+            if error_box[0] is None:
+                error_box[0] = e
+
+
+def _wait_for_chunk_ready(
+    index: int,
+    chunk_results: dict[int, np.ndarray],
+    result_lock: threading.Lock,
+    error_box: list[BaseException | None],
+    window: str,
+    idle_bgr: np.ndarray,
+) -> np.ndarray:
+    """Block until chunk ``index`` is encoded, encoding error, or user presses 'q'."""
+    while True:
+        with result_lock:
+            err = error_box[0]
+            if err is not None:
+                raise EncodingFailed(err) from err
+            bgr = chunk_results.get(index)
+            if bgr is not None:
+                return bgr
+        cv2.imshow(window, idle_bgr)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            raise QuitRequest()
+        time.sleep(0.001)
+
+
+def _log_encoding_failure(exc: EncodingFailed) -> None:
+    cause = exc.__cause__
+    if isinstance(cause, DataOverflowError):
+        logger.error("QR payload too large; try a smaller --chunk-chars: %s", cause)
+    else:
+        logger.error("Chunk encoding failed: %s", cause)
 
 
 def _show_code(window: str, bgr: np.ndarray, dwell: float) -> bool:
@@ -145,13 +252,21 @@ def main() -> int:
     except SystemExit:
         return 1
 
-    chunk_bgrs: list[np.ndarray] = []
-    for order, piece in enumerate(chunks):
-        payload = _json_compact({"type": CHUNK_TYPE, "order": order, "data": piece})
-        try:
-            chunk_bgrs.append(_make_qr_bgr(payload))
-        except SystemExit:
-            return 1
+    chunk_payloads = [
+        _json_compact({"type": CHUNK_TYPE, "order": order, "data": piece})
+        for order, piece in enumerate(chunks)
+    ]
+
+    chunk_results: dict[int, np.ndarray] = {}
+    result_lock = threading.Lock()
+    error_box: list[BaseException | None] = [None]
+    encode_thread = threading.Thread(
+        target=_chunk_encoding_worker,
+        args=(chunk_payloads, chunk_results, result_lock, error_box),
+        name="qr-chunk-encode",
+        daemon=True,
+    )
+    encode_thread.start()
 
     window = "QR send (q to quit)"
     logger.info(
@@ -163,11 +278,21 @@ def main() -> int:
         args.dwell,
     )
 
+    n_chunks = len(chunk_payloads)
     try:
         while True:
             if not _show_code(window, meta_bgr, args.dwell):
                 break
-            for bgr in chunk_bgrs:
+            for i in range(n_chunks):
+                try:
+                    bgr = _wait_for_chunk_ready(
+                        i, chunk_results, result_lock, error_box, window, meta_bgr
+                    )
+                except QuitRequest:
+                    return 0
+                except EncodingFailed as e:
+                    _log_encoding_failure(e)
+                    return 1
                 if not _show_code(window, bgr, args.dwell):
                     return 0
     finally:
