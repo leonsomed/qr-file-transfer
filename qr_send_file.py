@@ -33,6 +33,7 @@ from qr_transfer_constants import (
     CHUNK_HEX_CHARS_MIN,
     CHUNK_TYPE,
     DWELL_SECONDS_DEFAULT,
+    DWELL_SECONDS_MAX,
     DWELL_SECONDS_MIN,
     MAX_FILE_BYTES,
     METADATA_TYPE,
@@ -44,6 +45,41 @@ logger = logging.getLogger(__name__)
 
 CHUNK_HEX_CHARS = CHUNK_HEX_CHARS_DEFAULT
 MIN_CHUNKS_FOR_PROCESS_POOL = 8
+
+# OpenCV trackbar is integer steps; map 0..N to [DWELL_SECONDS_MIN, DWELL_SECONDS_MAX].
+_DWELL_TRACKBAR_MAX = 480
+
+
+def _dwell_from_trackbar_pos(pos: int) -> float:
+    pos = max(0, min(_DWELL_TRACKBAR_MAX, int(pos)))
+    span = DWELL_SECONDS_MAX - DWELL_SECONDS_MIN
+    return DWELL_SECONDS_MIN + (pos / _DWELL_TRACKBAR_MAX) * span
+
+
+def _trackbar_pos_from_dwell(dwell: float) -> int:
+    dwell = max(DWELL_SECONDS_MIN, min(DWELL_SECONDS_MAX, float(dwell)))
+    span = DWELL_SECONDS_MAX - DWELL_SECONDS_MIN
+    return int(round((dwell - DWELL_SECONDS_MIN) / span * _DWELL_TRACKBAR_MAX))
+
+
+def _init_sender_dwell_trackbar(window: str, initial_dwell: float) -> list[float]:
+    """Create send window + dwell slider (seconds per QR). Returns mutable [current_dwell]."""
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    dwell_ref = [
+        max(DWELL_SECONDS_MIN, min(DWELL_SECONDS_MAX, float(initial_dwell))),
+    ]
+
+    def _on_trackbar(pos: int) -> None:
+        dwell_ref[0] = _dwell_from_trackbar_pos(pos)
+
+    cv2.createTrackbar(
+        "seconds / QR",
+        window,
+        _trackbar_pos_from_dwell(dwell_ref[0]),
+        _DWELL_TRACKBAR_MAX,
+        _on_trackbar,
+    )
+    return dwell_ref
 
 
 def _qr_strings_from_frame(detector: cv2.QRCodeDetector, frame: np.ndarray) -> list[str]:
@@ -209,8 +245,13 @@ def _oneway_qr_with_caption_bar(bgr: np.ndarray, caption: str) -> np.ndarray:
     return np.vstack([bar, bgr])
 
 
-def _show_code(window: str, bgr: np.ndarray, dwell: float, caption: str | None = None) -> bool:
-    deadline = time.perf_counter() + dwell
+def _show_code(
+    window: str,
+    bgr: np.ndarray,
+    dwell_ref: list[float],
+    caption: str | None = None,
+) -> bool:
+    deadline = time.perf_counter() + dwell_ref[0]
     vis = _oneway_qr_with_caption_bar(bgr, caption) if caption else bgr
     while time.perf_counter() < deadline:
         cv2.imshow(window, vis)
@@ -222,7 +263,7 @@ def _show_code(window: str, bgr: np.ndarray, dwell: float, caption: str | None =
 def _show_code_bidirectional(
     window: str,
     bgr: np.ndarray,
-    dwell: float,
+    dwell_ref: list[float],
     cap: cv2.VideoCapture,
     detector: cv2.QRCodeDetector,
     digest_lower: str,
@@ -232,7 +273,7 @@ def _show_code_bidirectional(
 ) -> bool:
     placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
     last_cam = placeholder
-    deadline = time.perf_counter() + dwell
+    deadline = time.perf_counter() + dwell_ref[0]
     while time.perf_counter() < deadline:
         ok, frame = cap.read()
         if ok:
@@ -269,7 +310,7 @@ def _show_code_bidirectional(
 def _run_oneway_loop(
     window: str,
     meta_bgr: np.ndarray,
-    args: argparse.Namespace,
+    dwell_ref: list[float],
     n_chunks: int,
     chunk_results: dict[int, np.ndarray],
     result_lock: threading.Lock,
@@ -277,7 +318,7 @@ def _run_oneway_loop(
 ) -> int:
     try:
         while True:
-            if not _show_code(window, meta_bgr, args.dwell, caption="metadata"):
+            if not _show_code(window, meta_bgr, dwell_ref, caption="metadata"):
                 break
             for i in range(n_chunks):
                 try:
@@ -295,7 +336,7 @@ def _run_oneway_loop(
                 except EncodingFailed as e:
                     _log_encoding_failure(e)
                     return 1
-                if not _show_code(window, bgr, args.dwell, caption=f"order {i}"):
+                if not _show_code(window, bgr, dwell_ref, caption=f"order {i}"):
                     return 0
     finally:
         cv2.destroyAllWindows()
@@ -309,7 +350,7 @@ def _run_bidirectional_loop(
     metadata_json: str,
     digest_lower: str,
     chunk_count: int,
-    args: argparse.Namespace,
+    dwell_ref: list[float],
     chunk_results: dict[int, np.ndarray],
     result_lock: threading.Lock,
     error_box: list[BaseException | None],
@@ -406,7 +447,7 @@ def _run_bidirectional_loop(
         if not _show_code_bidirectional(
             window,
             meta_bgr,
-            args.dwell,
+            dwell_ref,
             cap,
             detector,
             digest_lower,
@@ -467,7 +508,7 @@ def _run_bidirectional_loop(
                 if not _show_code_bidirectional(
                     window,
                     bgr,
-                    args.dwell,
+                    dwell_ref,
                     cap,
                     detector,
                     digest_lower,
@@ -531,7 +572,10 @@ def main() -> int:
         default=DWELL_SECONDS_DEFAULT,
         dest="dwell",
         metavar="SEC",
-        help=f"Seconds each QR is shown (default: {DWELL_SECONDS_DEFAULT}, min: {DWELL_SECONDS_MIN})",
+        help=(
+            f"Seconds each QR is shown (default: {DWELL_SECONDS_DEFAULT}; "
+            f"range: {DWELL_SECONDS_MIN}–{DWELL_SECONDS_MAX}, adjustable live via slider)"
+        ),
     )
     args = parser.parse_args()
 
@@ -551,6 +595,9 @@ def main() -> int:
 
     if args.dwell < DWELL_SECONDS_MIN:
         logger.error("--dwell must be at least %s (got %s)", DWELL_SECONDS_MIN, args.dwell)
+        return 1
+    if args.dwell > DWELL_SECONDS_MAX:
+        logger.error("--dwell must be at most %s (got %s)", DWELL_SECONDS_MAX, args.dwell)
         return 1
 
     CHUNK_HEX_CHARS = args.chunk_chars
@@ -600,8 +647,10 @@ def main() -> int:
     encode_thread.start()
 
     window = "QR send (q to quit)"
+    dwell_ref = _init_sender_dwell_trackbar(window, args.dwell)
     logger.info(
-        "Sending %s (%s bytes), %s data chunks, mode=%s, chunk_chars=%s, dwell=%ss",
+        "Sending %s (%s bytes), %s data chunks, mode=%s, chunk_chars=%s, dwell=%ss "
+        "(use trackbar to change seconds per QR while running)",
         path.name,
         size,
         len(chunks),
@@ -614,7 +663,13 @@ def main() -> int:
 
     if args.mode == "one-way":
         return _run_oneway_loop(
-            window, meta_bgr, args, n_chunks, chunk_results, result_lock, error_box
+            window,
+            meta_bgr,
+            dwell_ref,
+            n_chunks,
+            chunk_results,
+            result_lock,
+            error_box,
         )
 
     cap = cv2.VideoCapture(args.camera)
@@ -629,7 +684,7 @@ def main() -> int:
         metadata_json,
         digest_lower,
         n_chunks,
-        args,
+        dwell_ref,
         chunk_results,
         result_lock,
         error_box,
