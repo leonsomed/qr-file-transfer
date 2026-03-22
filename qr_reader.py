@@ -61,6 +61,8 @@ def main() -> int:
 
             if data:
                 out_path.write_text(data, encoding="utf-8")
+                print(data)
+                break
 
             cv2.imshow("QR reader (q to quit)", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
