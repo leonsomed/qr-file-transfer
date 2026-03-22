@@ -6,7 +6,7 @@ qr-file-transfer is a utility to transfer files between devices via an ad-hoc pr
 
 This project was created to transfer files to an arigap device. However, it is also useful to transfer files to systems that might be compromised and you would prefer not to use storage devices like USB sticks. Also, it is useful in case you don't have a USB stick and the devices do not support any other form file transfer.
 
-Keep in mind that transfer speed via this protocol is very slow compared to most transfer protocols. If you expect to transfer more than a few MBs it would take a very long time so you might want to find a different way. However, it is very reasonable to transferi files below a few MBs.
+Keep in mind that transfer speed via this protocol is very slow compared to most transfer protocols. If you expect to transfer more than a few MBs it would take a very long time so you might want to find a different way. However, it is very reasonable to transfer files below a few MBs.
 
 ### Static mode
 
