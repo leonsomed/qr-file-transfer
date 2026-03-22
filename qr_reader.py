@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -61,12 +60,7 @@ def main() -> int:
                 cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
 
             if data:
-                try:
-                    json.loads(data)
-                    out_path.write_text(data, encoding="utf-8")
-                    break
-                except json.JSONDecodeError:
-                    pass
+                out_path.write_text(data, encoding="utf-8")
 
             cv2.imshow("QR reader (q to quit)", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
